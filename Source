@@ -1,0 +1,420 @@
+# ----- 1  Import Modules --------
+
+from machine import Pin, ADC, I2C
+from dht import DHT11
+from time import sleep
+from plant_profile import plants       # Define module for plant data
+import network                         # used to work on internet and wifi 
+import urequests                       # used to send internet requests
+import ujson                           # used for internet data exchange                          
+import ssd1306                         # used for oled working
+
+# ---------  2  System Constants --------
+
+ssid = "Dhaaran"                      # SSID - Service Set Identifier (Wifi Name)
+password = "12345678"                 # Wifi Credentials
+wifi_timeout = 10                     # Max waiting time for wifi connection
+oled_delay = 2
+long_oled_delay = 3                   # Oled Delays   
+history_limit = 5                     # History list limit
+
+# Health Score Weights 
+moisture_weight = 0.40
+temperature_weight = 0.25
+humidity_weight = 0.20
+light_weight = 0.15
+
+# Calibration Values  
+bright = 2000
+dark = 64000
+dry = 65535
+wet = 47000
+
+# Firebase URL
+firebase_url = "https://plantpulse-8697a-default-rtdb.asia-southeast1.firebasedatabase.app/plant.json"
+
+# ------- 3 Wi-FI Configuration ---------
+
+wlan = network.WLAN(network.STA_IF)            # WLAN - Wireless Local Area Network, STA_IF - Station Interface means Pico W acts as Client (connects to hotspot) 
+wlan.active(True)                              # turns on Wifi hardware
+
+print("Connecting to WiFi...")
+wlan.connect(ssid, password)                   # connects to credentials 
+
+while wifi_timeout > 0:
+    if wlan.isconnected():                     # if wifi connected within 10sec break loop
+        break
+
+    print("Waiting for WiFi Connection...")    # if not connected keeps checking
+    wifi_timeout -= 1                          # timing decreases 10 - 9 - 8 ....
+    sleep(1)
+
+if wlan.isconnected():
+    print("WiFi Connected")
+    print("IP Address:", wlan.ifconfig()[0])   # if connected print IP address [0] - returns only IP address 
+else:
+    print("WiFi Connection Failed")
+
+# ------- 4 Sensor Initialization ---------
+
+soil_sensor = ADC(28)                   # Soil Moisture Sensor                              
+ldr_sensor = ADC(26)                    # LDR Sensor
+# DHT11 Sensor
+dht_pin = Pin(16, Pin.IN, Pin.PULL_UP)
+dht_sensor = DHT11(dht_pin)
+# OLED 
+i2c = I2C(0, scl=Pin(5), sda=Pin(4), freq=400000)
+oled = ssd1306.SSD1306_I2C(128, 64, i2c)                 # 128x64 pixels
+
+# ------ 5 OLED Display Function ----------
+
+def oled_screen(line1 = "", line2 = "", delay = oled_delay):
+    oled.fill(0)                                    # clears OLED screen
+    oled.text(str(line1)[:16], 0, 0)                # 0,0 - x,y coordinates  
+    oled.text(str(line2)[:16], 0, 20)               # each character 8 pixels, then 128/8 = 16 is max 
+    oled.show()                                     # used to display  
+    sleep(delay)
+
+# ----- 6 Sensor Calibration Functions -------
+
+# Moisture Sensor
+def moist_calibrate(soil_value):
+    moist_percent = ((dry - soil_value) / (dry - wet)) * 100
+    
+    if moist_percent > 100:
+        return 100
+    elif moist_percent < 0:
+        return 0
+    return round(moist_percent, 2)                     # round value to 2 decimals
+
+# LDR Sensor
+def ldr_calibrate(light_value):
+    ldr_percent = ((dark - light_value) / (dark - bright)) * 100
+    
+    if ldr_percent > 100:
+        return 100
+    elif ldr_percent < 0:
+        return 0
+    return round(ldr_percent, 2)
+
+# -------- 7 Plant Health Scoring Functions -------------
+
+# Individual Parameter Scoring Function
+def parameter_score(value, low, high, step):
+
+    if low <= value <= high:
+        return 100
+    elif (low - step) <= value < low or \
+         high < value <= (high + step):
+        return 80
+    elif (low - 2 * step) <= value < (low - step) or \
+         (high + step) < value <= (high + 2 * step):
+        return 60
+    elif (low - 3 * step) <= value < (low - 2 * step) or \
+         (high + 2 * step) < value <= (high + 3 * step):
+        return 40
+    elif (low - 4 * step) <= value < (low - 3 * step) or \
+         (high + 3 * step) < value <= (high + 4 * step):
+        return 20
+    return 0
+
+# Overall Health Scoring Function
+def health_score(moisture_score, temperature_score, humidity_score, light_score):
+
+    health = (
+        moisture_weight * moisture_score +
+        temperature_weight * temperature_score +
+        humidity_weight * humidity_score +
+        light_weight * light_score
+    )
+    return round(health, 2)
+
+# Health Status Function
+def status(health):
+    
+    if health >= 85:
+        return "Excellent"
+    elif health >= 70:
+        return "Good"
+    elif health >= 50:
+        return "Average"
+    elif health >= 25:
+        return "Warning"
+    return "Critical"
+
+# ----- 8 Utility Functions ----------
+
+# History Function for storing health scores
+def update_history(history, value, limit = history_limit):
+    
+    history.append(value)
+    if len(history) > limit:             # stores 5 values 
+        history.pop(0)
+
+# Trend Function for returning plant health trend
+def trend(history):
+
+    if len(history) < 5:                 # requires 5 values for trend
+        return "Collecting"
+
+    average_previous = (sum(history[:-1]) / (len(history) - 1))    # averages the first 4 values 
+    difference = history[-1] - average_previous                    # difference of average and last value
+
+    if difference >= 5:
+        return "Improving"
+    elif difference <= -5:
+        return "Declining"
+    return "Stable"
+
+# Health Prediction Function
+def predict_health(history):
+
+    if len(history) < 3:          # requires 3 values for prediction         
+        return 0
+
+    changes = []
+    
+    for i in range(1, len(history)):
+        changes.append(history[i] - history[i - 1])      # difference of the adjacent elements
+
+    average_change = sum(changes) / len(changes)         # averaging the distance
+    predicted_health = (history[-1] + average_change)    # adding the average to last element
+
+    if predicted_health > 100:
+        return 100
+    elif predicted_health < 0:
+        return 0
+    return round(predicted_health, 2)
+
+# Limiting Factor Function
+def limiting_factor(moisture_score, temperature_score, humidity_score, light_score):
+
+    scores = {                                    # Score dictionary to store different parameter scores
+        "Moisture": moisture_score,
+        "Temperature": temperature_score,
+        "Humidity": humidity_score,
+        "Light": light_score
+        }
+
+    lowest_score = min(scores.values())         # returns the minimum score
+
+    if lowest_score >= 80:
+        return "None"
+    return min(scores, key=scores.get)         # returns the key with that minimum score
+
+# Recommendation Function
+def recommend(factor):
+    if factor == "Moisture":
+        return "Adjust Moisture"
+    elif factor == "Temperature":
+        return "Adjust Temp"
+    elif factor == "Humidity":
+        return "Adjust Humidity"
+    elif factor == "Light":
+        return "Adjust Light"
+    return "Plant Healthy"
+
+# --------- 9 Firebase Communication Function ----------
+
+def send_to_firebase(
+    plant_name,
+    moisture,
+    temperature,
+    humidity,
+    light,
+    score,
+    plant_status,
+    plant_trend,
+    future_health,
+    factor,
+    recommendation
+):
+                                                           # data dictionary for internet transfer
+    data = {
+        "plant_name": plant_name,
+        "moisture": moisture,
+        "temperature": temperature,
+        "humidity": humidity,
+        "light": light,
+        "score": score,
+        "status": plant_status,
+        "trend": plant_trend,
+        "future_health": future_health,
+        "limiting_factor": factor,
+        "recommendation": recommendation
+    }
+
+    try:
+        response = urequests.patch(
+            firebase_url,                                  # patch method - updates the alreeady existing data
+            data=ujson.dumps(data),                        # dumps method - converts data dictionary into JSON format   
+            headers={"Content-Type": "application/json"}   # headers - extra info to prevent server rejection
+        )
+
+        print("Firebase Status:", response.status_code)    # responds with status codes - 200 (success) 
+        response.close()
+
+    except Exception as error:
+        print("Firebase Error:", error)
+        
+# History Lists for storing scores
+health_history = []
+moisture_history = []
+temperature_history = []
+humidity_history = []
+light_history = []
+
+# ---------- 10 Plant Selection -------------
+
+print("\nSelect Plant:\n")
+plant_names = list(plants.keys())              # returns all names from plant dictionary
+
+for i in range(len(plant_names)):
+    print(i + 1, ".", plant_names[i])
+
+while True:
+    try:
+        choice = int(input("\nEnter Choice: "))
+        if 1 <= choice <= len(plant_names):
+            break
+        print("Invalid Choice")
+
+    except ValueError:
+        print("Please Enter a Number")
+
+selected_plant = plant_names[choice - 1]
+print("\nSelected Plant:", selected_plant)
+
+oled_screen("Plant:",selected_plant[:16])
+
+# Load plant profile 
+profile = plants[selected_plant]
+
+# return plant specific threshold values
+m_low, m_high = profile["moisture"]
+t_low, t_high = profile["temperature"]
+h_low, h_high = profile["humidity"]
+l_low, l_high = profile["light"]
+
+# --------- 11 Main Loop ----------
+
+while True:
+
+    # Soil Moisture Sensor Reading and Calibration  
+    soil_value = soil_sensor.read_u16()
+    moisture_percent = moist_calibrate(soil_value)
+
+    # LDR Sensor Reading and Calibration
+    light_value = ldr_sensor.read_u16()
+    light_percent = ldr_calibrate(light_value)
+
+    # DHT reading and error handling
+    temperature = None
+    humidity = None
+    try:
+        dht_sensor.measure()
+        temperature = dht_sensor.temperature()
+        humidity = dht_sensor.humidity()
+
+    except Exception as error:
+        print("DHT Error:", error)
+
+    if temperature is None or humidity is None:  # Skip sensor cycle if DHT doesnot read values
+
+        print("Skipping Sensor Cycle")
+        sleep(2)
+        continue
+    
+    if not ((0 < humidity < 100) and (0 < temperature < 50)):  # check for valid temperature and humidity values 
+        continue
+
+    # Parameter Scoring Function call
+    moisture_score = parameter_score(moisture_percent, m_low, m_high, 10)   # step = 10
+    temperature_score = parameter_score(temperature, t_low, t_high, 3)      # step = 3
+    humidity_score = parameter_score(humidity, h_low, h_high, 10)
+    light_score = parameter_score(light_percent, l_low, l_high, 10)
+
+    score = health_score(moisture_score, temperature_score, humidity_score, light_score)
+    plant_status = status(score)
+
+    # Update each parameter history
+    update_history(health_history,score)
+    update_history(moisture_history, moisture_percent)
+    update_history(temperature_history, temperature)
+    update_history(humidity_history, humidity)
+    update_history(light_history, light_percent)
+
+    # Utility function call
+    plant_trend = trend(health_history)
+    future_health = predict_health(health_history)
+    factor = limiting_factor(moisture_score, temperature_score, humidity_score, light_score)
+    advice = recommend(factor)
+
+    # Serial Monitor Output
+    print("\n" + "="*45)
+    print("           PLANTPULSE SYSTEM REPORT")
+    print("="*45)
+
+    print("\nSENSOR VALUES")
+    print("-"*45)
+    print(f"Temperature : {temperature:.2f} C")
+    print(f"Humidity    : {humidity:.2f} %")
+    print(f"Moisture    : {moisture_percent:.2f} %")
+    print(f"Light       : {light_percent:.2f} %")
+
+    print("\nPLANT HEALTH ANALYSIS")
+    print("-"*45)
+    print(f"Health Score : {score:.2f} / 100")
+    print(f"Status       : {plant_status}")
+    print(f"Trend        : {plant_trend}")
+    print(f"Future Health: {future_health:.2f}")
+
+    print("\nDECISION SUPPORT")
+    print("-"*45)
+    print(f"Limiting Factor : {factor}")
+    print(f"Recommendation   : {advice}")
+
+    print("\n" + "="*45 + "\n")
+    
+    # Wi-fi Reconnection Function
+    if not wlan.isconnected():
+        
+        print("Reconnecting WiFi...")
+        wlan.connect(ssid, password)
+
+        retry = 5                                        # wait 5 sec for reconnection
+        while retry > 0 and not wlan.isconnected():
+            sleep(1)
+            retry -= 1
+
+
+    # Upload to dashboard
+    if wlan.isconnected():
+
+        send_to_firebase(
+            selected_plant,
+            moisture_percent,
+            temperature,
+            humidity,
+            light_percent,
+            score,
+            plant_status,
+            plant_trend,
+            future_health,
+            factor,
+            advice
+        )
+
+    oled_screen("PlantPulse", f"Score: {score}")                                  # Screen 1
+    oled_screen(f"Moisture:{moisture_percent}%", f"Temp:{temperature}C")          # Screen 2
+    oled_screen(f"Humidity:{humidity}%",f"Light:{light_percent}%")                # Screen 3
+    oled_screen(f"Status:{plant_status}", f"Trend:{plant_trend}")                 # Screen 4
+    oled_screen(f"Factor:{factor}", advice)                                       # Screen 5
+    oled_screen(f"Current:{score}", f"Future:{future_health}", long_oled_delay)   # Screen 6
+    
+    sleep(3)
+
+
+
+
+
